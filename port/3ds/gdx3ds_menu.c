@@ -45,6 +45,12 @@ extern void gdx3ds_stereo_set_iod_px(int px);
 extern int gdx3ds_stereo_get_conv_x100(void);
 extern void gdx3ds_stereo_set_conv_x100(int centi);
 extern void gdx3ds_disp_set_mode(int mode);
+/* lus_glue/gdx3ds_input_glue.c — the same clean-shutdown path the QUIT autotest script
+ * op and the desktop SDL_QUIT/WM_CLOSE handler use: flips a flag polled by main_3ds.cpp's
+ * frame-loop condition (`gdx3ds_quit_requested() == 0`), so the loop breaks and unwinds
+ * through the ordinary teardown — NOT the HOME/POWER path, which is what currently has
+ * no in-game equivalent and forces a hard reset. */
+extern void gdx_request_quit(void);
 
 /* ---- geometry ------------------------------------------------------------------ */
 #define MENU_COLS 40
@@ -97,6 +103,12 @@ static int sLogSkip = 0;        /* LOG tab scroll offset (lines back from live) 
 static int sDispMode = 0;       /* mirrors gdx3ds_disp mode for the radio UI */
 static int sDbgVerbose = 0;     /* live [debug] verbose latch (main loop reads) */
 static int sRivalDetail = 0;    /* [perf] rival_detail latch (Racer_Draw reads) */
+static int sQuitArmed = 0;      /* ABT tab: first tap arms QUIT, second tap (within window) fires it */
+static u64 sQuitArmTick = 0;
+
+/* Arm window: long enough for a deliberate double-tap, short enough that walking away
+ * from the ABT tab doesn't leave a live "one tap from quitting" button behind. */
+#define MENU_QUIT_ARM_MS 4000
 
 /* RIVAL-DETAIL port hook: read once per Racer_Draw by the decomp patch
  * (decomp-port-rival-detail.patch). 0=NATIVE 1=REDUCED 2=MINIMAL. Latched from
@@ -386,6 +398,9 @@ static void PaintDbg(void) {
     PaintRow(21, "to gdiffuser.ini [debug].");
 }
 
+#define MENU_QUIT_ROW0 20
+#define MENU_QUIT_ROW1 22
+
 static void PaintAbout(void) {
     PaintRow(4, "G-DIFFUSER - F-ZERO X on 3DS");
     PaintRow(6, "build %.34s", gdx3ds_fps_hud_build_id());
@@ -394,6 +409,14 @@ static void PaintAbout(void) {
     PaintRow(11, "base: G-Diffuser + libultraship");
     PaintRow(12, "3DS port: the gdx-3ds effort");
     PaintRow(14, "thanks for playing.");
+    PaintRow(18, "----------------------------------------");
+    if (sQuitArmed) {
+        PaintRow(MENU_QUIT_ROW0, "\x1b[7m       TAP AGAIN TO CONFIRM QUIT       \x1b[0m");
+        PaintRow(MENU_QUIT_ROW1, "closes cleanly, no HOME/POWER needed.");
+    } else {
+        PaintRow(MENU_QUIT_ROW0, "\x1b[7m               QUIT GAME               \x1b[0m");
+        PaintRow(MENU_QUIT_ROW1, "tap, then tap again to confirm.");
+    }
 }
 
 static void PaintPage(void) {
@@ -491,6 +514,7 @@ static void TouchTabBar(int col) {
                 sTab = t;
                 sCaptureAction = -1;
                 sLogSkip = 0;
+                sQuitArmed = 0;
                 sDirty = 1;
                 MenuLog("[menu] tab=%s", kTabs[t].label);
             }
@@ -724,6 +748,29 @@ static void TouchDbg(int row, int col) {
     sDirty = 1;
 }
 
+/* ABT tab: QUIT button. Two-tap confirm (arm, then confirm within MENU_QUIT_ARM_MS) so a
+ * stray/accidental tap on the "ABT" label immediately below the tab bar can never close
+ * the game outright. Calls the same gdx_request_quit() the autotest QUIT script op and
+ * the desktop window-close handler use — a clean, already-proven shutdown path (unlike
+ * the crash-prone POWER/HOME route this button exists to route around). */
+static void TouchAbout(int row, int col) {
+    (void)col;
+    if (row < MENU_QUIT_ROW0 || row > MENU_QUIT_ROW1) {
+        return;
+    }
+    const u64 now = svcGetSystemTick();
+    if (sQuitArmed && (now - sQuitArmTick) < (u64)(MENU_QUIT_ARM_MS * CPU_TICKS_PER_MSEC)) {
+        MenuLog("[menu] quit confirmed - requesting clean shutdown");
+        gdx_request_quit();
+        sQuitArmed = 0; /* the frame loop exits within one iteration; harmless either way */
+        return;
+    }
+    sQuitArmed = 1;
+    sQuitArmTick = now;
+    sDirty = 1;
+    MenuLog("[menu] quit armed (tap again within %ds to confirm)", MENU_QUIT_ARM_MS / 1000);
+}
+
 static void MenuHandleTouch(int row, int col) {
     if (row <= MENU_ROW_TABS) {
         TouchTabBar(col);
@@ -736,7 +783,8 @@ static void MenuHandleTouch(int row, int col) {
         case TAB_INPUT: TouchInput(row, col); break;
         case TAB_LOG:   TouchLog(row, col); break;
         case TAB_DBG:   TouchDbg(row, col); break;
-        default: break; /* STATUS/ABOUT: nothing tappable below the tab bar */
+        case TAB_ABOUT: TouchAbout(row, col); break;
+        default: break; /* STATUS: nothing tappable below the tab bar */
     }
 }
 
